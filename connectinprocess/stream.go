@@ -51,6 +51,10 @@ type streamPair struct {
 	stopWake   func() bool // releases the context.AfterFunc that wakes waiters
 	headerSent bool
 	serverErr  error
+
+	// budget bounds in-flight bytes when the call's context carries one.
+	// It is nil for unary calls and unbudgeted calls.
+	budget *connect.StreamBudget
 }
 
 // dispatch starts the server goroutine once.
@@ -186,6 +190,9 @@ type clientStream struct {
 	// end is the result of the Receive that ended the stream. Receive
 	// keeps returning it.
 	end error
+	// held is the receive budget reserved by the most recent response,
+	// released by the next Receive or when the stream ends.
+	held int
 }
 
 func newClientStream(ctx context.Context, t *transport, spec connect.Spec) *clientStream {
@@ -201,6 +208,12 @@ func newClientStream(ctx context.Context, t *transport, spec connect.Spec) *clie
 	if stream.clientInfo != nil {
 		stream.clientInfo.Spec = spec
 	}
+	// Unary calls never queue messages, so a budget does not apply.
+	if spec.StreamType != connect.StreamTypeUnary {
+		if budget, ok := connect.StreamBudgetFromContext(ctx); ok {
+			stream.budget = budget
+		}
+	}
 	return stream
 }
 
@@ -211,6 +224,24 @@ func (s *clientStream) SendHeaders() error {
 
 func (s *clientStream) Send(msg any) error {
 	s.dispatch()
+	if s.budget != nil {
+		// No framing is exchanged in-process, so the payload size is the
+		// windowed byte count.
+		size := messageSize(msg)
+		if err := s.budget.AcquireSend(s.ctx, size); err != nil {
+			return err
+		}
+		if err := s.send(&s.request, msg); err != nil {
+			// The server never received the message.
+			s.budget.ReleaseSend(size)
+			return err
+		}
+		s.budget.NoteSent(size)
+		// send returns only once the server's Receive has copied the
+		// message, so it no longer occupies this process's send window.
+		s.budget.ReleaseSend(size)
+		return nil
+	}
 	return s.send(&s.request, msg)
 }
 
@@ -218,6 +249,10 @@ func (s *clientStream) CloseSend() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.request.close()
+	if s.budget != nil {
+		// No further request message may succeed; wake a budgeted Send.
+		s.budget.CloseSend()
+	}
 	return nil
 }
 
@@ -249,6 +284,9 @@ func (s *clientStream) Receive(dst any) error {
 // then report the cancellation instead of a clean end.
 func (s *clientStream) Close() error {
 	s.cancel()
+	if s.budget != nil {
+		_ = s.budget.Close()
+	}
 	return s.CloseSend()
 }
 
@@ -258,20 +296,61 @@ func (s *clientStream) next(dst any) error {
 		return s.end
 	}
 	s.dispatch()
+	if s.budget != nil && s.held > 0 {
+		// The previous response has been processed, so its window is free.
+		s.budget.ReleaseReceive(s.held)
+		s.held = 0
+	}
+	if s.budget != nil {
+		// Reserve one slot before the server may deliver. The rendezvous
+		// pipe carries no framing, so a zero-length reservation admits the
+		// handoff; the real byte count is reconciled after the copy.
+		if err := s.budget.AcquireReceive(s.ctx, 1); err != nil {
+			s.finish(err)
+			return err
+		}
+	}
 	filled, err := s.receive(&s.response, dst)
-	if filled {
+	if !filled {
+		if s.budget != nil {
+			// Nothing was delivered against the reservation.
+			s.budget.ReleaseReceive(1)
+		}
+		if errors.Is(err, io.EOF) && s.serverErr != nil {
+			err = asClientErr(s.serverErr)
+		}
+		s.finish(err)
 		return err
 	}
-	if errors.Is(err, io.EOF) && s.serverErr != nil {
-		err = asClientErr(s.serverErr)
+	if s.budget != nil {
+		// Reconcile the placeholder reservation with the bytes the server
+		// actually copied into dst, then hold them until the next Receive.
+		size := messageSize(dst)
+		s.budget.ReleaseReceive(1)
+		if err := s.budget.AcquireReceive(s.ctx, size); err != nil {
+			s.finish(err)
+			return err
+		}
+		s.held = size
+		s.budget.NoteReceived(size)
 	}
-	s.finish(err)
 	return err
 }
 
 // finish ends the stream with err and releases the stream context.
 func (s *clientStream) finish(err error) {
+	if s.end != nil {
+		return
+	}
 	s.end = err
+	if s.budget != nil {
+		if s.held > 0 {
+			s.budget.ReleaseReceive(s.held)
+			s.held = 0
+		}
+		// End both windows: any budgeted Send or Receive must wake now.
+		_ = s.budget.Close()
+	}
 	s.stopWake()
 	s.cancel()
 }

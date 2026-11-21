@@ -379,7 +379,16 @@ func (t *transport) NewClientStream(ctx context.Context, spec connect.Spec) (con
 	if spec.StreamType == connect.StreamTypeUnary {
 		return &connectUnaryClientStream{conn: conn, info: info, protoClient: protocolClient, streamType: spec.StreamType}, nil
 	}
-	return &connectStreamingClientStream{conn: conn, info: info, protoClient: protocolClient, streamType: spec.StreamType}, nil
+	stream := &connectStreamingClientStream{conn: conn, info: info, protoClient: protocolClient, streamType: spec.StreamType}
+	// A budget rides the call context, so interceptor wrappers and retries
+	// share the same byte windows. Unary calls never queue and ignore it.
+	if budget, ok := connect.StreamBudgetFromContext(ctx); ok {
+		if bc, ok := conn.(budgetConn); ok {
+			bc.attachBudget(budget)
+			stream.budget = budget
+		}
+	}
+	return stream, nil
 }
 
 // clientStateForSpec returns the client state for spec. It resolves on first

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"sync"
 
 	"connectrpc.com/connect/v2"
 	"connectrpc.com/connect/v2/internal/bufferpool"
@@ -52,6 +53,9 @@ type envelopeWriter struct {
 	compressionPool  *compressionPool
 	sendMaxBytes     int
 	stats            *connect.MessageStats
+	// budget, when set, bounds the bytes of messages the peer has not yet
+	// consumed. It is nil on the server side and for unary calls.
+	budget *connect.StreamBudget
 }
 
 func (w *envelopeWriter) Marshal(message any) *connect.Error {
@@ -97,8 +101,38 @@ func (w *envelopeWriter) Write(flags uint8, buffer *bytes.Buffer) *connect.Error
 	} else if w.sendMaxBytes > 0 && size > w.sendMaxBytes {
 		return connect.Errorf(connect.CodeResourceExhausted, "message size %d exceeds sendMaxBytes %d", size, w.sendMaxBytes)
 	}
+	// Account the bytes actually put on the wire, including framing: the
+	// peer buffers exactly that many bytes before reading. Protocol
+	// messages such as end-of-stream are not budgeted.
+	wireBytes := 0
+	if w.budget != nil && flags&^flagEnvelopeCompressed == 0 {
+		wireBytes = buffer.Len()
+		if err := w.budget.AcquireSend(w.ctx, wireBytes); err != nil {
+			if errors.Is(err, io.EOF) {
+				// The send side is closed: report the same terminal
+				// signal a closed request pipe would.
+				return connect.Errorf(connect.CodeUnknown, "%s", io.EOF).WithCause(io.EOF)
+			}
+			if connectErr, ok := asError(err); ok {
+				return connectErr
+			}
+			return connect.Errorf(connect.CodeUnknown, "acquire send budget: %s", err).WithCause(err)
+		}
+	}
 	if err := w.write(flags, buffer); err != nil {
+		// The message never reached the peer, so its reservation is free
+		// to admit another attempt.
+		if wireBytes > 0 {
+			w.budget.ReleaseSend(wireBytes)
+		}
 		return err
+	}
+	if wireBytes > 0 {
+		w.budget.NoteSent(wireBytes)
+		// The write returned only once the transport accepted the bytes
+		// (a flow-controlled HTTP/2 write, or the peer's in-process read),
+		// so they no longer occupy this process's send window.
+		w.budget.ReleaseSend(wireBytes)
 	}
 	// Protocol messages, like the end of stream, aren't counted.
 	if w.stats != nil && flags&^flagEnvelopeCompressed == 0 {
@@ -137,6 +171,28 @@ type envelopeReader struct {
 	compressionPool *compressionPool
 	readMaxBytes    int
 	stats           *connect.MessageStats
+	// budget, when set, bounds the bytes of messages delivered to the
+	// caller but not yet released. It is nil on the server side and for
+	// unary calls.
+	budget *connect.StreamBudget
+	// heldMu guards held, which Close may touch concurrently with a
+	// blocked Receive.
+	heldMu sync.Mutex
+	// held is the receive budget reserved by the message returned from
+	// the most recent Read, released before the next Read or when the
+	// stream ends.
+	held int
+}
+
+// releaseHeld returns the receive budget reserved by the previous message.
+func (r *envelopeReader) releaseHeld() {
+	r.heldMu.Lock()
+	held := r.held
+	r.held = 0
+	r.heldMu.Unlock()
+	if r.budget != nil && held > 0 {
+		r.budget.ReleaseReceive(held)
+	}
 }
 
 // Read reads the next enveloped message into a pooled buffer, decompressing
@@ -146,6 +202,9 @@ type envelopeReader struct {
 // A message with protocol-specific flags ends the stream. Read checks that no
 // data follows it, and leaves the message for the caller to interpret.
 func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
+	// The caller has finished with the previous message, so its receive
+	// window is available to admit the next one.
+	r.releaseHeld()
 	buffer := bufferpool.Get()
 	// Read the prefix into the buffer's spare capacity. It isn't kept: the
 	// message overwrites it.
@@ -183,6 +242,21 @@ func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
 		}
 		return buffer, 0, connect.Errorf(connect.CodeResourceExhausted, "message size %d is larger than configured max %d", size, r.readMaxBytes)
 	}
+	// Reserve receive room before pulling the body off the wire: a slow
+	// caller applies backpressure instead of buffering unbounded messages.
+	// Framing bytes count, since they occupy transport buffers too.
+	if r.budget != nil && flags&^flagEnvelopeCompressed == 0 {
+		wireBytes := int(size) + envelopePrefixSize
+		if acquireErr := r.budget.AcquireReceive(r.ctx, wireBytes); acquireErr != nil {
+			if connectErr, ok := asError(acquireErr); ok {
+				return buffer, 0, connectErr
+			}
+			return buffer, 0, connect.Errorf(connect.CodeUnknown, "acquire receive budget: %s", acquireErr).WithCause(acquireErr)
+		}
+		r.heldMu.Lock()
+		r.held = wireBytes
+		r.heldMu.Unlock()
+	}
 	// The buffer grows as bytes arrive since size comes from the peer.
 	r.limited = io.LimitedReader{R: r.reader, N: size}
 	readN, err := buffer.ReadFrom(&r.limited)
@@ -193,6 +267,7 @@ func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
 		err = io.EOF // ReadFrom hides EOF, so a short read needs it put back
 	}
 	if err != nil {
+		r.releaseHeld()
 		if errors.Is(err, io.EOF) {
 			// We've gotten fewer bytes than we expected, so the stream has ended
 			// unexpectedly.
@@ -213,6 +288,7 @@ func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
 	compressedSize := 0
 	if flags&flagEnvelopeCompressed != 0 {
 		if r.compressionPool == nil {
+			r.releaseHeld()
 			return buffer, 0, connect.Errorf(connect.CodeInternal,
 				"protocol error: sent compressed message without compression support",
 			)
@@ -224,6 +300,7 @@ func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
 			bufferpool.Put(buffer)
 			buffer = decompressed
 			if err != nil {
+				r.releaseHeld()
 				return buffer, 0, err
 			}
 		}
@@ -233,8 +310,17 @@ func (r *envelopeReader) Read() (*bytes.Buffer, uint8, *connect.Error) {
 		if r.stats != nil {
 			*r.stats = connect.MessageStats{Size: buffer.Len(), CompressedSize: compressedSize}
 		}
+		if r.budget != nil {
+			r.heldMu.Lock()
+			held := r.held
+			r.heldMu.Unlock()
+			r.budget.NoteReceived(held)
+		}
 		return buffer, flags, nil
 	}
+	// A protocol message ends the stream; it was never reserved against the
+	// application window.
+	r.releaseHeld()
 	// Drain the rest of the stream to ensure there is no extra data.
 	numBytes, err := discard(r.reader)
 	r.bytesRead += numBytes

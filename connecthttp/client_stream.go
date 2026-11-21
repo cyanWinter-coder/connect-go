@@ -17,6 +17,7 @@ package connecthttp
 import (
 	"errors"
 	"io"
+	"sync/atomic"
 
 	"connectrpc.com/connect/v2"
 )
@@ -120,6 +121,14 @@ func (s *connectUnaryClientStream) Close() error {
 	return wrapIfUncoded(err)
 }
 
+// budgetConn is the subset of streamingClientConn that manages a
+// [connect.StreamBudget]. Both protocol families' streaming conns satisfy
+// it.
+type budgetConn interface {
+	attachBudget(budget *connect.StreamBudget)
+	closeBudget()
+}
+
 // connectStreamingClientStream adapts a streaming [streamingClientConn] to [connect.ClientStream].
 type connectStreamingClientStream struct {
 	conn        streamingClientConn
@@ -130,6 +139,21 @@ type connectStreamingClientStream struct {
 	headerFlushed bool
 	syncedHeader  bool
 	rxErr         error // returned by Receive once the stream has ended
+
+	budget    *connect.StreamBudget // nil when the call carries no budget
+	budgetEnd atomic.Bool           // closeBudget runs once, even across Close and Receive
+}
+
+// closeBudget ends both budget windows and releases every reserved byte,
+// waking a Send or Receive blocked on either side. It is idempotent and
+// safe to call concurrently with a blocked Receive.
+func (s *connectStreamingClientStream) closeBudget() {
+	if s.budget == nil || !s.budgetEnd.CompareAndSwap(false, true) {
+		return
+	}
+	if bc, ok := s.conn.(budgetConn); ok {
+		bc.closeBudget()
+	}
 }
 
 // flushHeader merges request metadata, then writes protocol headers.
@@ -161,7 +185,14 @@ func (s *connectStreamingClientStream) Send(msg any) error {
 
 func (s *connectStreamingClientStream) CloseSend() error {
 	s.flushHeader()
-	return wrapIfUncoded(s.conn.CloseRequest())
+	err := wrapIfUncoded(s.conn.CloseRequest())
+	// No further message may succeed on the send side. Closing the window
+	// also wakes a Send blocked on budget, for example when the peer has
+	// stopped reading.
+	if s.budget != nil {
+		s.budget.CloseSend()
+	}
+	return err
 }
 
 func (s *connectStreamingClientStream) Receive(dst any) error {
@@ -174,6 +205,7 @@ func (s *connectStreamingClientStream) Receive(dst any) error {
 		if err != nil {
 			s.rxErr = err
 		}
+		s.closeBudget()
 		return err
 	}
 	err := wrapIfUncoded(s.conn.Receive(dst))
@@ -188,6 +220,9 @@ func (s *connectStreamingClientStream) Receive(dst any) error {
 		}
 		_ = s.conn.CloseResponse()
 		s.rxErr = err
+		// The peer has stopped sending, so release the receive window and
+		// wake any send still waiting on this side.
+		s.closeBudget()
 	}
 	return err
 }
@@ -197,6 +232,7 @@ func (s *connectStreamingClientStream) Close() error {
 	// after it doesn't send a request that was never started.
 	err := s.conn.CloseResponse()
 	_ = s.conn.CloseRequest()
+	s.closeBudget()
 	return wrapIfUncoded(err)
 }
 

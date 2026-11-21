@@ -690,6 +690,21 @@ func (cc *connectStreamingClientConn) onResponseReceive(fn func(*http.Response))
 	cc.duplexCall.onResponseReceive = fn
 }
 
+// attachBudget enforces budget on the stream's message envelopes.
+func (cc *connectStreamingClientConn) attachBudget(budget *connect.StreamBudget) {
+	cc.marshaler.envelopeWriter.budget = budget
+	cc.unmarshaler.envelopeReader.budget = budget
+}
+
+// closeBudget releases every byte the stream still holds. The stream calls
+// it once, on whichever side ends first.
+func (cc *connectStreamingClientConn) closeBudget() {
+	cc.unmarshaler.envelopeReader.releaseHeld()
+	if budget := cc.marshaler.envelopeWriter.budget; budget != nil {
+		_ = budget.Close()
+	}
+}
+
 func (cc *connectStreamingClientConn) validateResponse(response *http.Response) *connect.Error {
 	if response.StatusCode != http.StatusOK {
 		return connect.Errorf(httpToCode(response.StatusCode), "HTTP status %v", response.Status).WithRemote()

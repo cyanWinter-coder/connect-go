@@ -458,6 +458,21 @@ func (pingServer) Sum(ctx context.Context, stream pingv1connect.PingServiceSumSe
 }
 ```
 
+### Stream budgets
+
+A bidirectional stream whose producer outruns its consumer can buffer without limit. A [`StreamBudget`](https://pkg.go.dev/connectrpc.com/connect/v2#StreamBudget) bounds that buffering with two byte windows, one per direction, and blocks the stream when a window is full:
+
+```go
+budget := connect.NewStreamBudget(64*1024 /* send */, 64*1024 /* receive */)
+ctx := connect.WithStreamBudget(context.Background(), budget)
+stream, err := client.CumSum(ctx)
+```
+
+Before each `Send` or `Receive`, the transport reserves the message's on-the-wire bytes against the matching window and waits for room, honoring the call's context if it is canceled. A `Send` reservation is released once the peer's transport accepts the bytes; a `Receive` reservation stays held until the caller's next `Receive`, so a slow consumer applies backpressure to the producer. The budget rides the call context, so interceptor wrappers and retries share one set of windows. `SendBytes` and `ReceiveBytes` report the in-flight bytes and the count of messages and bytes actually delivered; failed sends are never counted.
+
+A zero or negative window is valid: the first non-empty message fails with `CodeResourceExhausted` instead of deadlocking. Unary calls ignore budgets, and closing either direction wakes the other and releases every outstanding reservation.
+
+
 ## Metadata
 
 Headers and trailers travel on a [`CallInfo`](https://pkg.go.dev/connectrpc.com/connect/v2#CallInfo) carried by the context, which replaces the v1 `Request[T]` and `Response[T]` wrappers. There is one way to read or write metadata in v2.
